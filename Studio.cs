@@ -139,7 +139,10 @@ namespace NtscStudio {
             bool fractional=new[]{24,30,60,120,240}.Any(n=>Math.Abs(clockSource-n*1000.0/1001)<0.002);
             string clock=fractional?"60000/1001":"60/1";
             double clockFps=Ratio(clock);
-            string rate=info.Fps+1e-8>=clockFps?info.Rate:clock;
+            // Preserve every source frame; at low FPS alternate phases per source frame
+            // so sampling a 60 Hz clock cannot freeze the two-phase effect.
+            string rate=info.Rate;
+            if(info.Fps<clockFps) {clock=rate;clockFps=info.Fps;}
             return new FrameTiming {Rate=rate,Fps=Ratio(rate),ClockRate=clock,ClockFps=clockFps};
         }
         public static VideoInfo Probe(string input) {
@@ -183,8 +186,8 @@ namespace NtscStudio {
         static string DecodeArgs(string input,VideoInfo info,FrameTiming timing,int w,int h,double? time) {
             string seek=time.HasValue?"-ss "+time.Value.ToString("0.######",CultureInfo.InvariantCulture)+" ":"";
             return "-hide_banner -loglevel error -nostdin -threads 1 -filter_threads 1 "+seek+"-i "+Q(input)+
-                " -map 0:"+info.StreamIndex+" -an -sn -dn -vf "+Q("scale="+w+":"+h+":flags=area,setsar=1,setpts=PTS-STARTPTS,fps="+timing.Rate)+
-                (time.HasValue?" -frames:v 1":"")+" -threads 1 -f rawvideo -pix_fmt rgb24 pipe:1";
+                " -map 0:"+info.StreamIndex+" -an -sn -dn -vf "+Q("scale="+w+":"+h+":flags=area,setsar=1,setpts=PTS-STARTPTS")+
+                (time.HasValue?" -frames:v 1":"")+" -fps_mode passthrough -threads 1 -f rawvideo -pix_fmt rgb24 pipe:1";
         }
         static bool ReadFrame(Stream stream,byte[] bytes,CancellationToken cancel) {
             int n=0;
@@ -507,12 +510,12 @@ namespace NtscStudio {
                     var fast=Engine.Timing(new VideoInfo {Rate="120/1",Fps=120},animate);
                     var still=Engine.Timing(new VideoInfo {Rate="30/1",Fps=30},new Options());
                     var capture=Engine.Timing(new VideoInfo {Rate="45794160/766999",Fps=45794160.0/766999,NominalFps=2997.0/50},animate);
-                    if(capture.ClockRate!="60000/1001"||capture.Rate!="60000/1001")throw new Exception("Capture dropped-frame nominal timing failed");
-                    if(thirty.Rate!="60/1"||fractional.Rate!="60000/1001"||still.Rate!="60/1")throw new Exception("Frame rate selection failed");
+                    if(capture.ClockRate!="45794160/766999"||capture.Rate!="45794160/766999")throw new Exception("Capture average timing preservation failed");
+                    if(thirty.Rate!="30/1"||fractional.Rate!="30000/1001"||still.Rate!="30/1")throw new Exception("Frame rate preservation failed");
                     for(int i=0;i<10000;i++) {
                         if(thirty.Phase(i)!=i%2||fractional.Phase(i)!=i%2||fast.Phase(i)!=(i/2)%2)throw new Exception("Phase clock drift");
                     }
-                    File.WriteAllText(args[1],"30->60; 29.97->59.94; 120 fps timed phases; always moving; 10000 frames without drift: PASS");return 0;
+                    File.WriteAllText(args[1],"30->30; 29.97->29.97; 120 fps timed phases; source-rate flicker; 10000 frames without drift: PASS");return 0;
                 }
                 if(args.Length>0&&args[0]=="--test-resolution") {
                     int w,h;

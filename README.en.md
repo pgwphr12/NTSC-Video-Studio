@@ -103,12 +103,10 @@ Output dimensions retain the original display size, but detail lost at a lower w
 
 ### Frame timing
 
-- Phases alternate on a 60 or 60000/1001 fps clock.
-- 30 fps input produces 60 fps output; 29.97 fps input produces 59.94 fps output.
-- 24/25 fps input produces 60 fps output; 23.976 fps input produces 59.94 fps output.
-- Faster inputs retain their average frame rate, with phase changes scheduled by time. At 120 fps, the phase changes every two frames.
-- Duplicated source frames are filtered independently for each output frame.
-- An NTSC-family nominal frame rate selects the 59.94 clock even when dropped frames lower the measured average rate.
+- Preserve the source average frame rate and frame count, including 24/25/30 and 23.976/29.97 fps. No frames are repeated to increase the output to 60 fps.
+- Below the 60/59.94 fps clock, alternate phase 0/1 on every source frame to prevent frozen patterns. A complete A→B→A cycle at 30 fps is 15 Hz.
+- At or above that clock, retain the existing phase timing. At 120 fps, the phase changes every two frames.
+- Variable-frame-rate inputs retain all decoded frames but are saved at a constant average frame rate. Individual original frame timestamps are not preserved, and total duration may be rounded to the output frame interval.
 
 The preview animates the two phases of one selected scene. It is not a full video player.
 

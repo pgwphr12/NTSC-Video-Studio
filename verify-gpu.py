@@ -57,12 +57,15 @@ for mode in ('cpu','gpu'):
     assert 'renderer='+mode in pathlib.Path(str(out)+'.result.txt').read_text(encoding='utf-8-sig')
     data=json.loads(run([assets/'ffprobe.exe','-v','error','-show_streams','-of','json',out]))
     streams={s['codec_type']:s for s in data['streams']}
-    assert streams['video']['avg_frame_rate']=='60/1' and streams['audio']['codec_name']=='aac'
+    assert streams['video']['avg_frame_rate']=='30/1' and streams['audio']['codec_name']=='aac'
+    original=json.loads(run([assets/'ffprobe.exe','-v','error','-select_streams','v:0','-show_streams','-of','json',source]))['streams'][0]
+    assert streams['video']['nb_frames']==original['nb_frames']
+    assert abs(float(streams['video']['duration'])-float(original['duration']))<0.001
     assert (streams['video']['width'],streams['video']['height'])==(640,360)
 run([exe,'--test-preview',source,work/'gpu-preview','--renderer=gpu'])
 assert (work/'gpu-preview-after.png').exists()
 run([exe,'--ui-snapshot',work/'gpu-ui.png',source,'--renderer=gpu'])
-checks.append('GPU preview, UI selection and CPU/GPU encoded 30->60 fps outputs with original dimensions/audio: PASS')
+checks.append('GPU preview, UI selection and CPU/GPU encoded 30->30 fps outputs with original dimensions/audio: PASS')
 long=work/'cancel.mp4'
 run([assets/'ffmpeg.exe','-v','error','-y','-f','lavfi','-i','testsrc2=size=640x360:rate=30:duration=8','-c:v','libx264','-threads','1','-preset','ultrafast',long])
 run([exe,'--test-cancel',long,work/'cancelled.mp4','--renderer=gpu'])

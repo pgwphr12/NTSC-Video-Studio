@@ -29,8 +29,8 @@ assert out.exists() and not (foreign/'vid').exists() and not (work/'vid').exists
 data=json.loads(run([assets/'ffprobe.exe','-v','error','-show_streams','-of','json',out]))
 streams={s['codec_type']:s for s in data['streams']}
 assert streams['video']['width']==640 and streams['video']['height']==360
-assert streams['video']['avg_frame_rate']=='60/1' and streams['audio']['codec_name']=='aac'
-checks.append('Encoding creates executable-adjacent vid and exact title_NISC.mp4; dimensions, 30->60 fps and AAC audio preserved: PASS')
+assert streams['video']['avg_frame_rate']=='30/1' and streams['audio']['codec_name']=='aac'
+checks.append('Encoding creates executable-adjacent vid and exact title_NISC.mp4; dimensions, 30->30 fps and AAC audio preserved: PASS')
 digest=hashlib.sha256(out.read_bytes()).digest()
 run([exe,'--export',source])
 assert (portable/'vid'/'영상 제목 한글_NISC_2.mp4').exists()
