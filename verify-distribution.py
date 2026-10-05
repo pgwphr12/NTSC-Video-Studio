@@ -1,5 +1,5 @@
 """Validate the portable layout and automatic vid export from an unrelated working directory."""
-import pathlib, subprocess, os, tempfile, uuid, shutil, json, hashlib
+import pathlib, subprocess, os, tempfile, uuid, shutil, json, hashlib, ctypes
 app=pathlib.Path(__file__).resolve().parent.parent
 parent=pathlib.Path(os.environ.get('NTSC_TEST_ROOT',tempfile.gettempdir())).resolve()
 work=parent/('ntsc-distribution-test-'+uuid.uuid4().hex);work.mkdir(mode=0o777)
@@ -7,7 +7,7 @@ portable=work/'한글 배포 폴더';portable.mkdir(mode=0o777)
 assets=portable/'assets';assets.mkdir(mode=0o777)
 foreign=work/'unrelated cwd';foreign.mkdir(mode=0o777)
 for name in ('NTSC Video Studio.exe','NTSC Video Studio.exe.config'):shutil.copyfile(app/name,portable/name)
-for name in ('ffmpeg.exe','ffprobe.exe','ntsc.dll'):shutil.copyfile(app/'assets'/name,assets/name)
+for name in ('ffmpeg.exe','ffprobe.exe','ntsc.dll','ntsc.hlsl'):shutil.copyfile(app/'assets'/name,assets/name)
 # A same-named bogus DLL in cwd must never replace the packaged DLL.
 (foreign/'ntsc.dll').write_bytes(b'Not a native library')
 exe=portable/'NTSC Video Studio.exe';checks=[]
@@ -37,6 +37,14 @@ assert (portable/'vid'/'영상 제목 한글_NISC_2.mp4').exists()
 assert hashlib.sha256(out.read_bytes()).digest()==digest
 assert sorted(p.suffix for p in (portable/'vid').iterdir())==['.mp4','.mp4']
 checks.append('Repeated export selects title_NISC_2.mp4, leaves the existing video intact and creates no sidecar in vid: PASS')
+lib=ctypes.CDLL(str(assets/'ntsc.dll'));lib.ntsc_gpu_available.argtypes=[ctypes.c_void_p,ctypes.c_int]
+available=lib.ntsc_gpu_available(None,0)
+release=ctypes.WinDLL('kernel32').FreeLibrary;release.argtypes=[ctypes.c_void_p];release.restype=ctypes.c_int
+assert release(lib._handle);del lib
+if available:
+    run([exe,'--export',source,'--renderer=gpu'])
+    assert (portable/'vid'/'영상 제목 한글_NISC_3.mp4').exists()
+    checks.append('GPU automatic export loads the shader from assets in a Korean/spaced portable path and saves title_NISC_3.mp4: PASS')
 long=work/'cancel-source.mp4'
 run([assets/'ffmpeg.exe','-v','error','-y','-f','lavfi','-i','testsrc2=size=640x360:rate=30:duration=8','-c:v','libx264','-threads','1','-preset','ultrafast',long])
 cancelled=portable/'vid'/'cancel_NISC.mp4'

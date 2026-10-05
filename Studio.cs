@@ -22,6 +22,7 @@ namespace NtscStudio {
         public int EffectScale=0; // 0: retain the V1-sized effect grid at high resolutions.
         public double[] Values=new double[10];
         public int Scanlines=0;
+        public bool UseGpu=false;
         public Options() { Values[7]=0.25;Values[8]=0.30;Values[9]=0.20;Values[4]=0.05; }
     }
     sealed class VideoInfo {
@@ -61,14 +62,30 @@ namespace NtscStudio {
         static extern int ntsc_process(IntPtr handle,[In] byte[] rgb,int inputBytes,[Out] byte[] dest,int outputBytes,int frame);
         [DllImport("ntsc.dll",CallingConvention=CallingConvention.Cdecl)]
         static extern void ntsc_destroy(IntPtr handle);
+        [DllImport("ntsc.dll",CallingConvention=CallingConvention.Cdecl,CharSet=CharSet.Unicode,ExactSpelling=true)]
+        static extern IntPtr ntsc_create_gpu(int width,int height,[In] double[] options,int edgeStrength,int scanline,int patternSize,int displayWidth,int displayHeight,string shader);
+        [DllImport("ntsc.dll",CallingConvention=CallingConvention.Cdecl)]
+        static extern int ntsc_gpu_available([Out] byte[] name,int capacity);
+        [DllImport("ntsc.dll",CallingConvention=CallingConvention.Cdecl)]
+        static extern IntPtr ntsc_gpu_error();
+        static string GpuError() { return Marshal.PtrToStringAnsi(ntsc_gpu_error())??"GPU processing failed"; }
+        public static string GpuName() {
+            EnsureLibrary();var name=new byte[512];
+            if(ntsc_gpu_available(name,name.Length)==0)throw new Exception("GPU 렌더링을 사용할 수 없습니다. CPU를 선택해 주세요.\n"+GpuError());
+            int count=Array.IndexOf(name,(byte)0);return Encoding.UTF8.GetString(name,0,count<0?name.Length:count);
+        }
         IntPtr handle;
+        bool gpu;
         public int Width,Height;
         public NativeFilter(int width,int height,Options options,int displayWidth=0,int displayHeight=0) {
             EnsureLibrary();
             Width=((width-1)/3+1)*7;bool large=(long)Width*height*6>100000000;
             Height=height*(large?1:2);if(large)Width=Math.Max(2,displayWidth>0?displayWidth:width);
-            handle=ntsc_create(width,height,options.Values,options.EdgeStrength,options.Scanlines,options.PatternSize,Math.Max(2,displayWidth>0?displayWidth:width),Math.Max(2,displayHeight>0?displayHeight:height));
-            if(handle==IntPtr.Zero) throw new Exception("NTSC 필터를 초기화할 수 없습니다.");
+            int dw=Math.Max(2,displayWidth>0?displayWidth:width),dh=Math.Max(2,displayHeight>0?displayHeight:height);
+            gpu=options.UseGpu;
+            handle=gpu?ntsc_create_gpu(width,height,options.Values,options.EdgeStrength,options.Scanlines,options.PatternSize,dw,dh,Path.Combine(Engine.Assets,"ntsc.hlsl")):
+                ntsc_create(width,height,options.Values,options.EdgeStrength,options.Scanlines,options.PatternSize,dw,dh);
+            if(handle==IntPtr.Zero) throw new Exception(gpu?"GPU 필터를 초기화할 수 없습니다. CPU를 선택해 주세요.\n"+GpuError():"NTSC 필터를 초기화할 수 없습니다.");
         }
         public byte[] Apply(byte[] input,int frame) {
             var output=new byte[checked(Width*Height*3)];
@@ -76,7 +93,7 @@ namespace NtscStudio {
         }
         public void Apply(byte[] input,byte[] output,int frame) {
             if(ntsc_process(handle,input,input.Length,output,output.Length,frame)==0)
-                throw new Exception("NTSC 프레임 처리에 실패했습니다.");
+                throw new Exception(gpu?"GPU 프레임 처리에 실패했습니다.\n"+GpuError():"NTSC 프레임 처리에 실패했습니다.");
         }
         public void Dispose() { if(handle!=IntPtr.Zero){ntsc_destroy(handle);handle=IntPtr.Zero;} }
     }
@@ -281,6 +298,8 @@ namespace NtscStudio {
         readonly NumericUpDown seek=new NumericUpDown { DecimalPlaces=1,Increment=1,Width=85,Maximum=360000 };
         readonly ComboBox resolution=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Dock=DockStyle.Fill };
         readonly ComboBox preset=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Dock=DockStyle.Fill };
+        readonly ComboBox renderer=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Width=215 };
+        readonly Label gpuStatus=new Label { Dock=DockStyle.Bottom,Height=25,AutoEllipsis=true,ForeColor=Color.FromArgb(75,85,95),Text="NTSC 필터 처리 방식 선택" };
         readonly TrackBar strength=new TrackBar { Minimum=20,Maximum=100,Value=80,TickStyle=TickStyle.None,Dock=DockStyle.Fill,AutoSize=false };
         readonly ComboBox pattern=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Width=165 };
         readonly System.Windows.Forms.Timer animation=new System.Windows.Forms.Timer { Interval=16 };
@@ -303,6 +322,11 @@ namespace NtscStudio {
             var head=new Panel { Dock=DockStyle.Fill };
             head.Controls.Add(new Label { Text="NTSC Video Studio",Font=new Font("맑은 고딕",21,FontStyle.Bold),AutoSize=true,Location=new Point(0,0) });
             head.Controls.Add(new Label { Text="영상에 아날로그 색 번짐과 경계 무늬를 더하세요.",AutoSize=true,Location=new Point(2,43),ForeColor=Color.FromArgb(75,85,95) });root.Controls.Add(head,0,0);
+            var renderPanel=new Panel { Dock=DockStyle.Right,Width=350 };
+            var renderRow=new FlowLayoutPanel { Dock=DockStyle.Top,Height=35 };
+            renderRow.Controls.Add(new Label { Text="렌더링",AutoSize=true,Padding=new Padding(0,5,8,0) });renderRow.Controls.Add(renderer);
+            renderPanel.Controls.Add(renderRow);renderPanel.Controls.Add(gpuStatus);head.Controls.Add(renderPanel);
+            renderer.Items.AddRange(new object[]{"CPU · 기본","GPU · Direct3D 11"});renderer.SelectedIndex=0;
             var files=new TableLayoutPanel { Dock=DockStyle.Fill,ColumnCount=2 };
             files.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));files.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,115));
             files.Controls.Add(path,0,0);files.Controls.Add(open,1,0);root.Controls.Add(files,0,1);root.Controls.Add(infoLabel,0,2);
@@ -341,10 +365,14 @@ namespace NtscStudio {
             settings.Controls.Add(export,0,12);body.Controls.Add(settings,1,0);
             root.Controls.Add(bar,0,4);
             var foot=new TableLayoutPanel { Dock=DockStyle.Fill,ColumnCount=2 };foot.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));foot.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,80));foot.Controls.Add(status,0,0);foot.Controls.Add(cancel,1,0);root.Controls.Add(foot,0,5);
-            edits.AddRange(new Control[]{open,preset,resolution,strength,pattern,scanlines,seek,preview});
+            edits.AddRange(new Control[]{open,preset,resolution,strength,pattern,scanlines,seek,preview,renderer});
             preset.SelectedIndexChanged+=(s,e)=>SetPreset();preset.SelectedIndex=4;
             resolution.SelectedIndexChanged+=(s,e)=>UpdateInfoLabel();
             pattern.SelectedIndexChanged+=(s,e)=>UpdateInfoLabel();
+            renderer.SelectedIndexChanged+=(s,e)=>{
+                if(renderer.SelectedIndex==1)try{gpuStatus.Text=NativeFilter.GpuName();}catch(Exception ex){renderer.SelectedIndex=0;MessageBox.Show(this,ex.Message,"GPU 렌더링",MessageBoxButtons.OK,MessageBoxIcon.Information);}
+                else gpuStatus.Text="CPU · NTSC 필터 처리";
+            };
             open.Click+=async(s,e)=>await OpenVideo();preview.Click+=async(s,e)=>await UpdatePreview();export.Click+=async(s,e)=>await ExportVideo();
             cancel.Click+=(s,e)=>{if(cancellation!=null){cancel.Enabled=false;status.Text="취소 중…";cancellation.Cancel();}};
             FormClosing+=(s,e)=>{if(busy){e.Cancel=true;MessageBox.Show(this,"진행 중인 작업이 끝나거나 취소된 뒤 창을 닫아 주세요.","작업 진행 중");}};
@@ -361,7 +389,7 @@ namespace NtscStudio {
                 case 4: sliders[7].Value=25;sliders[8].Value=30;sliders[9].Value=20;sliders[4].Value=5;break;
             }
         }
-        Options ReadOptions() { return new Options {WorkWidth=new[]{256,384,512,640,768,1024,1536,1920,2560,3840,5120,7680}[resolution.SelectedIndex],Values=sliders.Select(x=>x.Value/100.0).ToArray(),EdgeStrength=strength.Value,EffectScale=new[]{0,1,2,3,4,6,8,12,16,24,32}[pattern.SelectedIndex],Scanlines=scanlines.Checked?15:0}; }
+        Options ReadOptions() { return new Options {WorkWidth=new[]{256,384,512,640,768,1024,1536,1920,2560,3840,5120,7680}[resolution.SelectedIndex],Values=sliders.Select(x=>x.Value/100.0).ToArray(),EdgeStrength=strength.Value,EffectScale=new[]{0,1,2,3,4,6,8,12,16,24,32}[pattern.SelectedIndex],Scanlines=scanlines.Checked?15:0,UseGpu=renderer.SelectedIndex==1}; }
         void UpdateInfoLabel() {
             if(video==null)return;
             var timing=Engine.Timing(video,ReadOptions());
@@ -407,7 +435,8 @@ namespace NtscStudio {
             }
             after.Image=phases[0];animationClock.Restart();animation.Start();
         }
-        public void LoadSnapshotVideo(string file) {
+        public void LoadSnapshotVideo(string file,bool gpu=false) {
+            renderer.SelectedIndex=gpu?1:0;
             input=file;video=Engine.Probe(file);path.Text=Path.GetFileName(file);
             UpdateInfoLabel();
             SetPictures(Engine.Preview(file,video,ReadOptions(),0));SetBusy(false);status.Text="무지개빛 오가며 깜빡임 재생 중 · 설정 변경 후 미리보기를 눌러 주세요.";
@@ -430,11 +459,18 @@ namespace NtscStudio {
         void ShowError(Exception ex){status.Text="작업을 완료하지 못했습니다.";MessageBox.Show(this,ex.Message,"확인",MessageBoxButtons.OK,MessageBoxIcon.Error);}
     }
     static class Program {
+        static void SelectRenderer(string[] args,Options options) {
+            string value=args.FirstOrDefault(x=>x.StartsWith("--renderer="));
+            if(value==null)return;
+            if(value=="--renderer=gpu")options.UseGpu=true;
+            else if(value=="--renderer=cpu")options.UseGpu=false;
+            else throw new Exception("Renderer must be cpu or gpu.");
+        }
         [STAThread] static int Main(string[] args) {
             try {
                 if(args.Length>0&&args[0]=="--export") {
                     if(args.Length<2)throw new Exception("--export INPUT");
-                    var options=new Options();var info=Engine.Probe(args[1]);
+                    var options=new Options();SelectRenderer(args,options);var info=Engine.Probe(args[1]);
                     int w,h;Engine.WorkingSize(info,options,out w,out h);
                     string target=Engine.CreateVideoOutputPath(args[1]);
                     Engine.ConvertVideo(args[1],target,info,options,CancellationToken.None,(n,s)=>{});return 0;
@@ -442,6 +478,7 @@ namespace NtscStudio {
                 if(args.Length>0&&args[0]=="--convert") {
                     if(args.Length<3)throw new Exception("--convert INPUT OUTPUT [WIDTH: 64..8192]");
                     var options=new Options();
+                    SelectRenderer(args,options);
                     if(args.Length>3&&args[3]!="--animate") {
                         options.WorkWidth=int.Parse(args[3]);
                     }
@@ -450,7 +487,7 @@ namespace NtscStudio {
                     if(scaleArg!=null){options.EffectScale=int.Parse(scaleArg.Substring(15));if(options.EffectScale<0||options.EffectScale>32)throw new Exception("Effect scale must be 0(auto) or 1..32.");}
                     var info=Engine.Probe(args[1]);long count=Engine.ConvertVideo(args[1],args[2],info,options,CancellationToken.None,(n,s)=>{});
                     var timing=Engine.Timing(info,options);
-                    File.WriteAllText(args[2]+".result.txt","frames="+count+"\nfps="+timing.Rate+"\ninput_fps="+info.Rate+"\nphase_clock="+timing.ClockRate,Encoding.UTF8);return 0;
+                    File.WriteAllText(args[2]+".result.txt","frames="+count+"\nfps="+timing.Rate+"\ninput_fps="+info.Rate+"\nphase_clock="+timing.ClockRate+"\nrenderer="+(options.UseGpu?"gpu":"cpu"),Encoding.UTF8);return 0;
                 }
                 if(args.Length>0&&args[0]=="--self-test") {
                     var opts=new Options();int w=256,h=24;var rgb=new byte[w*h*3];
@@ -496,7 +533,8 @@ namespace NtscStudio {
                     File.WriteAllText(args[1],"V1 width default, aspect ratio, 8K effect resolution and oversized guard: PASS");return 0;
                 }
                 if(args.Length>0&&args[0]=="--test-preview") {
-                    var pictures=Engine.Preview(args[1],Engine.Probe(args[1]),new Options(),0);
+                    var settings=new Options();SelectRenderer(args,settings);
+                    var pictures=Engine.Preview(args[1],Engine.Probe(args[1]),settings,0);
                     using(pictures[0])pictures[0].Save(args[2]+"-before.png",ImageFormat.Png);
                     using(pictures[1])pictures[1].Save(args[2]+"-after.png",ImageFormat.Png);
                     pictures[2].Dispose();
@@ -504,8 +542,8 @@ namespace NtscStudio {
                 }
                 if(args.Length>0&&args[0]=="--test-cancel") {
                     using(var token=new CancellationTokenSource()) {
-                        var info=Engine.Probe(args[1]);token.CancelAfter(200);
-                        try{Engine.ConvertVideo(args[1],args[2],info,new Options(),token.Token,(n,s)=>{});throw new Exception("Cancellation did not occur");}
+                        var info=Engine.Probe(args[1]);token.CancelAfter(200);var settings=new Options();SelectRenderer(args,settings);
+                        try{Engine.ConvertVideo(args[1],args[2],info,settings,token.Token,(n,s)=>{});throw new Exception("Cancellation did not occur");}
                         catch(OperationCanceledException){if(File.Exists(args[2]))throw new Exception("Cancelled output was committed");return 0;}
                     }
                 }
@@ -513,7 +551,7 @@ namespace NtscStudio {
                 if(args.Length>0&&args[0]=="--ui-snapshot") {
                     using(var form=new MainForm()){
                         form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-20000,-20000);form.ShowInTaskbar=false;
-                        form.Show();Application.DoEvents();if(args.Length>2)form.LoadSnapshotVideo(args[2]);form.PerformLayout();Application.DoEvents();
+                        form.Show();Application.DoEvents();if(args.Length>2)form.LoadSnapshotVideo(args[2],args.Contains("--renderer=gpu"));form.PerformLayout();Application.DoEvents();
                         using(var bmp=new Bitmap(form.Width,form.Height)){form.DrawToBitmap(bmp,new Rectangle(0,0,bmp.Width,bmp.Height));bmp.Save(args[1],ImageFormat.Png);}form.Close();
                     }return 0;
                 }

@@ -8,7 +8,7 @@
 
 - Windows 10/11, 64비트
 - .NET Framework 4.8
-- `assets` 폴더의 `ffmpeg.exe`, `ffprobe.exe`, `ntsc.dll`
+- `assets` 폴더의 `ffmpeg.exe`, `ffprobe.exe`, `ntsc.dll`, `ntsc.hlsl`
 
 실행에는 Python이나 Visual Studio가 필요하지 않습니다. ROM이나 MesenCE 전체 프로그램도 필요하지 않습니다. 현재 화면과 안내 문구는 한국어입니다.
 
@@ -23,7 +23,8 @@ NTSC-Video-Studio/
 ├─ assets/
 │  ├─ ffmpeg.exe
 │  ├─ ffprobe.exe
-│  └─ ntsc.dll
+│  ├─ ntsc.dll
+│  └─ ntsc.hlsl
 ├─ licenses/
 └─ source/
    ├─ README.md
@@ -33,12 +34,16 @@ NTSC-Video-Studio/
    ├─ verify.py
    ├─ verify-whole.py
    ├─ verify-distribution.py
+   ├─ verify-gpu.py
    └─ native/
       ├─ bridge.cpp
       ├─ snes_ntsc.cpp
       ├─ snes_ntsc.h
       ├─ snes_ntsc_impl.h
-      └─ snes_ntsc_config.h
+      ├─ snes_ntsc_config.h
+      ├─ gpu.cpp
+      ├─ gpu.h
+      └─ ntsc.hlsl
 ```
 
 `vid` 폴더는 처음에는 없습니다. 영상 열기와 미리보기에서는 생성하지 않으며, 인코딩을 시작하면 실행 파일과 같은 폴더 아래에 자동 생성합니다.
@@ -80,7 +85,7 @@ FFmpeg 디코딩 → 작업 해상도 변환 → RGB24 → BGR555
 → H.264/AAC MP4
 ```
 
-필터는 CPU에서 처리하며 GPU 셰이더를 사용하지 않습니다. 임의의 무지개 띠를 더하지 않고, Blargg가 만드는 위상 0과 1을 교대합니다. 경계 강조는 현재 위상 값 `c`와 반대 위상 값 `a`의 차이를 다음과 같이 증폭하는 추가 기능입니다.
+오른쪽 위에서 CPU/GPU 렌더링을 선택할 수 있으며 기본값은 CPU입니다. GPU는 Direct3D 11 컴퓨트 셰이더로 BGR555 변환, Blargg 룩업 평가, 두 위상 처리, 경계 강조와 스캔라인을 계산합니다. 룩업 초기화와 프레임 전송은 CPU를 사용하며, 최종 H.264 인코딩도 기존 CPU libx264 방식입니다. 임의의 무지개 띠를 더하지 않고, Blargg가 만드는 위상 0과 1을 교대합니다. 경계 강조는 현재 위상 값 `c`와 반대 위상 값 `a`의 차이를 다음과 같이 증폭하는 추가 기능입니다.
 
 ```text
 c + 1.5 × 경계 강도 × 강조 설정 × (c - a)
@@ -170,3 +175,17 @@ python .\source\verify-distribution.py
 - 포함 FFmpeg: Gyan의 FFmpeg 9.0.2 essentials 빌드. 빌드 정보와 라이선스는 `licenses` 폴더를 참고하세요.
 
 원본 필터의 저작권 고지와 함께 소스 및 라이선스를 배포 패키지에 포함합니다.
+
+## CPU / GPU 선택
+
+오른쪽 위에서 CPU 또는 GPU · Direct3D 11을 선택한 뒤 미리보기를 갱신합니다. 미리보기와 저장에 함께 적용됩니다. GPU는 실제 하드웨어 어댑터와 Direct3D feature level 11.0 이상을 요구합니다. 처음 사용 가능한 호환 어댑터를 선택해 이름을 표시합니다. 소프트웨어 WARP 렌더링으로 GPU를 대신하지 않으며 GPU 처리 실패도 안내합니다. 성능은 해상도·전송·장치에 따라 달라집니다.
+
+assets/ntsc.hlsl은 Windows D3DCompiler로 실행 시 컴파일합니다. 부동소수점 계산 차이로 CPU와 GPU의 색 값에 작은 차이가 날 수 있습니다. 이 선택은 NTSC 필터 렌더링을 바꾸며, H.264 저장 인코더는 두 모드 모두 동일한 CPU 방식입니다.
+
+```powershell
+& ".\NTSC Video Studio.exe" --export "input.mp4" --renderer=gpu
+& ".\NTSC Video Studio.exe" --convert "input.mp4" "output.mp4" 512 --renderer=gpu
+python .\source\verify-gpu.py
+```
+
+--renderer=cpu 또는 옵션 생략 시 CPU를 사용합니다. verify-gpu.py는 실제 GPU와 CPU 결과를 비교하고 미리보기·저장·취소·셰이더 오류를 검사합니다. 호환 장치가 없으면 검사 불가 이유를 출력합니다. 빌드는 d3d11.lib, dxgi.lib, d3dcompiler.lib를 링크하고 native/ntsc.hlsl을 assets로 복사합니다. gpu.cpp/gpu.h는 GPL-3.0-or-later이며, 셰이더의 룩업 평가는 원본 Blargg 매크로를 각색하고 출처를 표시했습니다.

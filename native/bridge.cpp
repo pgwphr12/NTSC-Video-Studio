@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <cstring>
+#include "gpu.h"
+static thread_local std::string gpuError;
 
 struct Filter {
     snes_ntsc_t ntsc;
@@ -15,6 +18,7 @@ struct Filter {
     std::vector<uint32_t> output, alternate;
     int scanline, edgeStrength, patternSize, displayWidth, displayHeight;
     std::vector<unsigned char> edges;
+    std::unique_ptr<GpuProcessor> gpu;
 };
 
 extern "C" __declspec(dllexport) void* __cdecl ntsc_create(
@@ -46,12 +50,39 @@ extern "C" __declspec(dllexport) void* __cdecl ntsc_create(
     } catch (...) { return nullptr; }
 }
 
+extern "C" __declspec(dllexport) const char* __cdecl ntsc_gpu_error() { return gpuError.c_str(); }
+extern "C" __declspec(dllexport) int __cdecl ntsc_gpu_available(char* name,int capacity) {
+    try {
+        std::string value=gpu_device_name();
+        if(name&&capacity>0){size_t n=std::min(value.size(),size_t(capacity-1));std::memcpy(name,value.data(),n);name[n]=0;}
+        gpuError.clear();return 1;
+    }catch(const std::exception& e){gpuError=e.what();return 0;}
+}
+extern "C" __declspec(dllexport) void* __cdecl ntsc_create_gpu(
+    int width,int height,const double* options,int edgeStrength,int scanline,int patternSize,
+    int displayWidth,int displayHeight,const wchar_t* shader) {
+    std::unique_ptr<Filter> f(static_cast<Filter*>(ntsc_create(width,height,options,edgeStrength,scanline,patternSize,displayWidth,displayHeight)));
+    if(!f){gpuError="Invalid dimensions/settings or insufficient memory";return nullptr;}
+    try {
+        static_assert(sizeof(snes_ntsc_rgb_t)==4,"GPU LUT requires Windows uint32 layout");
+        int rx=std::max(1,(width*f->patternSize+displayWidth-1)/displayWidth);
+        int ry=std::max(1,(height*f->patternSize+displayHeight-1)/displayHeight);
+        f->gpu=create_gpu(reinterpret_cast<const uint32_t*>(f->ntsc.table),sizeof(f->ntsc.table)/4,
+            width,height,f->outWidth,f->emitWidth,f->rowScale,f->edgeStrength,f->scanline,rx,ry,shader);
+        gpuError.clear();return f.release();
+    }catch(const std::exception& e){gpuError=e.what();return nullptr;}
+}
+
 extern "C" __declspec(dllexport) int __cdecl ntsc_process(
     void* handle, const unsigned char* rgb, int inputBytes,
     unsigned char* dest, int outputBytes, int frame) {
     Filter* f=static_cast<Filter*>(handle);
     if(!f || !rgb || !dest || inputBytes!=f->width*f->height*3 || outputBytes!=f->emitWidth*f->height*f->rowScale*3) return 0;
     const int phase=((frame%2)+2)%2;
+    if(f->gpu) {
+        try{f->gpu->process(rgb,dest,phase);return 1;}
+        catch(const std::exception& e){gpuError=e.what();return 0;}
+    }
     // Studio supplies working dimensions: rainbow and edge footprints share the filter grid.
     int rx=std::max(1,(f->width*f->patternSize+f->displayWidth-1)/f->displayWidth);
     int ry=std::max(1,(f->height*f->patternSize+f->displayHeight-1)/f->displayHeight);

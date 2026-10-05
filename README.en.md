@@ -8,7 +8,7 @@ A Windows application that applies the Blargg SNES NTSC filter from MesenCE to r
 
 - Windows 10/11, 64-bit
 - .NET Framework 4.8
-- `ffmpeg.exe`, `ffprobe.exe`, and `ntsc.dll` in `assets`
+- `ffmpeg.exe`, `ffprobe.exe`, `ntsc.dll`, and `ntsc.hlsl` in `assets`
 
 Python and Visual Studio are not required to run the application. No ROM or full MesenCE installation is needed. The current interface and messages are in Korean.
 
@@ -23,7 +23,8 @@ NTSC-Video-Studio/
 ├─ assets/
 │  ├─ ffmpeg.exe
 │  ├─ ffprobe.exe
-│  └─ ntsc.dll
+│  ├─ ntsc.dll
+│  └─ ntsc.hlsl
 ├─ licenses/
 └─ source/
    ├─ README.md
@@ -33,12 +34,16 @@ NTSC-Video-Studio/
    ├─ verify.py
    ├─ verify-whole.py
    ├─ verify-distribution.py
+   ├─ verify-gpu.py
    └─ native/
       ├─ bridge.cpp
       ├─ snes_ntsc.cpp
       ├─ snes_ntsc.h
       ├─ snes_ntsc_impl.h
-      └─ snes_ntsc_config.h
+      ├─ snes_ntsc_config.h
+      ├─ gpu.cpp
+      ├─ gpu.h
+      └─ ntsc.hlsl
 ```
 
 The `vid` directory does not initially exist. Opening a video or generating a preview does not create it. Starting an encode creates it beside the executable.
@@ -80,7 +85,7 @@ FFmpeg decoding → working resolution → RGB24 → BGR555
 → H.264/AAC MP4
 ```
 
-The filter runs on the CPU without a GPU shader. It alternates Blargg phases 0 and 1 rather than adding synthetic rainbow stripes. Additional edge enhancement amplifies the difference between the current phase value `c` and the opposite phase value `a`:
+The renderer selector at the top right offers CPU and GPU modes; CPU is the default. GPU mode runs BGR555 conversion, Blargg lookup evaluation, phase processing, edge enhancement, and scanlines in a Direct3D 11 compute shader. Lookup initialization and frame transfers remain on the CPU. Final H.264 encoding remains CPU-based libx264. It alternates Blargg phases 0 and 1 rather than adding synthetic rainbow stripes. Additional edge enhancement amplifies the difference between the current phase value `c` and the opposite phase value `a`:
 
 ```text
 c + 1.5 × edge strength × enhancement setting × (c - a)
@@ -170,3 +175,17 @@ Results are recorded in `VALIDATION.txt`. If the full-grid 8K check fails becaus
 - Bundled FFmpeg: Gyan's FFmpeg 9.0.2 essentials build. See `licenses` for build information and license files.
 
 Source code, license files, and the original filter's copyright notices are included in the distribution package.
+
+## CPU / GPU selection
+
+Select CPU or GPU · Direct3D 11 at the top right, then refresh the preview. This choice applies to preview and export. GPU mode requires a real hardware adapter supporting Direct3D feature level 11.0 or higher. It selects the first compatible adapter and shows its name. WARP software rendering is not substituted for hardware, and GPU processing failures are reported rather than silently switching to CPU. GPU speed depends on resolution, transfers, and hardware.
+
+The assets/ntsc.hlsl shader is compiled at runtime using the Windows D3DCompiler. Small CPU/GPU color differences may result from floating-point arithmetic. GPU encoding is not implemented: the selector controls NTSC rendering, with the same H.264 encoder in both modes.
+
+```powershell
+& ".\NTSC Video Studio.exe" --export "input.mp4" --renderer=gpu
+& ".\NTSC Video Studio.exe" --convert "input.mp4" "output.mp4" 512 --renderer=gpu
+python .\source\verify-gpu.py
+```
+
+Use --renderer=cpu or omit the option for CPU mode. verify-gpu.py compares actual hardware GPU output against CPU output and checks preview, export, cancellation, and explicit shader errors. It reports unavailability when no compatible hardware is present. The build links d3d11.lib, dxgi.lib, and d3dcompiler.lib and copies native/ntsc.hlsl to assets. The new gpu.cpp/gpu.h backend is GPL-3.0-or-later; the shader evaluator adapts the supplied Blargg macros, with attribution retained.
