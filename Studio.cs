@@ -14,6 +14,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using System.Reflection;
+
+[assembly: AssemblyVersion("0.0.4.0")]
+[assembly: AssemblyFileVersion("0.0.4.0")]
+[assembly: AssemblyInformationalVersion("0.0.4")]
 
 namespace NtscStudio {
     sealed class Options {
@@ -23,6 +28,8 @@ namespace NtscStudio {
         public double[] Values=new double[10];
         public int Scanlines=0;
         public bool UseGpu=false;
+        public string OutputRate=null,Encoder="cpu";
+        public int OutputMaxEdge=0,Quality=14;
         public Options() { Values[7]=0.25;Values[8]=0.30;Values[9]=0.20;Values[4]=0.05; }
     }
     sealed class VideoInfo {
@@ -110,7 +117,7 @@ namespace NtscStudio {
             Directory.CreateDirectory(folder);
             string title=Path.GetFileNameWithoutExtension(input);
             if(string.IsNullOrWhiteSpace(title))title="video";
-            string name=title+"_NISC",target=Path.Combine(folder,name+".mp4");
+            string name=title+"_NTSC",target=Path.Combine(folder,name+".mp4");
             for(int n=2;File.Exists(target)||Directory.Exists(target);n++)target=Path.Combine(folder,name+"_"+n+".mp4");
             return target;
         }
@@ -135,14 +142,16 @@ namespace NtscStudio {
             double den=Num(parts[1]);return den==0?0:Num(parts[0])/den;
         }
         public static FrameTiming Timing(VideoInfo info,Options options) {
-            double clockSource=info.NominalFps>0?info.NominalFps:info.Fps;
+            double clockSource=!string.IsNullOrEmpty(options.OutputRate)?Ratio(options.OutputRate):(info.NominalFps>0?info.NominalFps:info.Fps);
             bool fractional=new[]{24,30,60,120,240}.Any(n=>Math.Abs(clockSource-n*1000.0/1001)<0.002);
             string clock=fractional?"60000/1001":"60/1";
             double clockFps=Ratio(clock);
             // Preserve every source frame; at low FPS alternate phases per source frame
             // so sampling a 60 Hz clock cannot freeze the two-phase effect.
-            string rate=info.Rate;
-            if(info.Fps<clockFps) {clock=rate;clockFps=info.Fps;}
+            string rate=string.IsNullOrEmpty(options.OutputRate)?info.Rate:options.OutputRate;
+            double fps=Ratio(rate);
+            if(fps<1||fps>240)throw new Exception("저장 FPS는 1~240 범위여야 합니다.");
+            if(fps<clockFps) {clock=rate;clockFps=fps;}
             return new FrameTiming {Rate=rate,Fps=Ratio(rate),ClockRate=clock,ClockFps=clockFps};
         }
         public static VideoInfo Probe(string input) {
@@ -186,7 +195,7 @@ namespace NtscStudio {
         static string DecodeArgs(string input,VideoInfo info,FrameTiming timing,int w,int h,double? time) {
             string seek=time.HasValue?"-ss "+time.Value.ToString("0.######",CultureInfo.InvariantCulture)+" ":"";
             return "-hide_banner -loglevel error -nostdin -threads 1 -filter_threads 1 "+seek+"-i "+Q(input)+
-                " -map 0:"+info.StreamIndex+" -an -sn -dn -vf "+Q("scale="+w+":"+h+":flags=area,setsar=1,setpts=PTS-STARTPTS")+
+                " -map 0:"+info.StreamIndex+" -an -sn -dn -vf "+Q("scale="+w+":"+h+":flags=area,setsar=1,setpts=PTS-STARTPTS"+(time.HasValue||timing.Rate==info.Rate?"":",fps="+timing.Rate))+
                 (time.HasValue?" -frames:v 1":"")+" -fps_mode passthrough -threads 1 -f rawvideo -pix_fmt rgb24 pipe:1";
         }
         static bool ReadFrame(Stream stream,byte[] bytes,CancellationToken cancel) {
@@ -234,13 +243,37 @@ namespace NtscStudio {
             }
         }
         static void Kill(Process p) { try{if(p!=null&&!p.HasExited)p.Kill();}catch{} }
+        public static void OutputSize(VideoInfo info,Options options,out int w,out int h) {
+            double scale=options.OutputMaxEdge>0?Math.Min(1,(double)options.OutputMaxEdge/Math.Max(info.Width,info.Height)):1;
+            w=Math.Max(2,(int)Math.Round(info.Width*scale/2)*2);
+            h=Math.Max(2,(int)Math.Round(info.Height*scale/2)*2);
+            if(options.OutputMaxEdge==0){w=(info.Width+1)/2*2;h=(info.Height+1)/2*2;}
+        }
+        public static string VideoEncodingArgs(Options options,int w,int h) {
+            if(options.Quality<1||options.Quality>40)throw new Exception("압축 품질 값은 1~40 범위여야 합니다.");
+            if(options.Encoder=="nvenc")return "-c:v h264_nvenc -gpu any -preset p5 -tune hq -rc vbr -cq "+options.Quality+" -b:v 0 -rc-lookahead 0 -bf 0 -pix_fmt yuv420p";
+            if(options.Encoder!="cpu")throw new Exception("인코더는 cpu 또는 nvenc여야 합니다.");
+            return "-c:v libx264 "+((long)w*h>16777216?"-preset ultrafast -tune zerolatency -rc-lookahead 0":"-preset medium -rc-lookahead 8")+" -crf "+options.Quality+" -pix_fmt yuv420p -threads "+((long)w*h>16777216?"1":"2");
+        }
+        static void CheckEncoder(Options options,int w,int h,FrameTiming timing,CancellationToken cancel) {
+            if(options.Encoder=="cpu")return;
+            string args="-hide_banner -loglevel error -nostdin -filter_threads 1 -f lavfi -i "+Q("color=black:size="+w+"x"+h+":rate="+timing.Rate)+" -frames:v 1 "+VideoEncodingArgs(options,w,h)+" -f null -";
+            using(var p=Start("ffmpeg",args))using(cancel.Register(()=>Kill(p))) {
+                var error=p.StandardError.ReadToEndAsync();
+                if(!p.WaitForExit(20000)){Kill(p);p.WaitForExit();throw new Exception("NVIDIA 인코더 응답 시간이 초과되었습니다. 드라이버를 확인하거나 CPU 인코딩을 선택해 주세요.");}
+                cancel.ThrowIfCancellationRequested();
+                if(p.ExitCode!=0)throw new Exception("NVIDIA NVENC 인코딩을 시작할 수 없습니다.\nNVENC 지원 GPU·최신 NVIDIA 드라이버·선택한 저장 해상도를 확인해 주세요. CPU 인코딩으로 변경할 수도 있습니다.\n\n"+error.Result);
+            }
+        }
         public static long ConvertVideo(string input,string target,VideoInfo info,Options options,CancellationToken cancel,Action<long,double> progress) {
             if(info.Hdr)throw new Exception("현재 버전은 SDR 영상용입니다. HDR 영상을 SDR로 변환한 뒤 사용해 주세요.");
             if(string.Equals(Path.GetFullPath(input),Path.GetFullPath(target),StringComparison.OrdinalIgnoreCase))throw new Exception("원본과 다른 저장 경로를 선택해 주세요.");
             if(File.Exists(target))throw new Exception("이미 존재하는 파일입니다. 다른 이름을 선택해 주세요.");
             int w,h;WorkingSize(info,options,out w,out h);
             var timing=Timing(info,options);
-            int finalW=(info.Width+1)/2*2,finalH=(info.Height+1)/2*2;
+            int finalW,finalH;OutputSize(info,options,out finalW,out finalH);
+            string videoEncoding=VideoEncodingArgs(options,finalW,finalH);
+            CheckEncoder(options,finalW,finalH,timing,cancel);
             string partial=Path.Combine(Path.GetDirectoryName(Path.GetFullPath(target)),"."+Path.GetFileNameWithoutExtension(target)+"-"+Guid.NewGuid().ToString("N")+".partial.mp4");
             long count=0;bool complete=false;
             try {
@@ -250,12 +283,10 @@ namespace NtscStudio {
                     string audioFilter=info.AudioOffset<0?
                         "atrim=start="+(-info.AudioOffset).ToString("0.########",CultureInfo.InvariantCulture)+",asetpts=PTS-STARTPTS":
                         "asetpts=PTS-STARTPTS,adelay="+Math.Round(info.AudioOffset*1000).ToString(CultureInfo.InvariantCulture)+":all=1";
-                    string encodingPreset=(long)finalW*finalH>16777216?"-preset ultrafast -tune zerolatency -rc-lookahead 0":"-preset medium -rc-lookahead 8";
-                    string encodingThreads=(long)finalW*finalH>16777216?"1":"2";
                     string encodeArgs="-hide_banner -loglevel error -nostdin -y -threads 2 -f rawvideo -pixel_format rgb24 -video_size "+filter.Width+"x"+filter.Height+
                         " -framerate "+timing.Rate+" -i pipe:0 -i "+Q(input)+" -map 0:v:0 -map 1:a:0? -map_metadata 1 -vf "+
                         Q("scale="+finalW+":"+finalH+":flags=lanczos,setsar=1")+
-                        " -c:v libx264 "+encodingPreset+" -crf 14 -pix_fmt yuv420p -threads "+encodingThreads+" -filter_threads 1 -c:a aac -b:a 192k -af "+Q(audioFilter)+" -metadata:s:v:0 rotate=0 -movflags +faststart "+Q(partial);
+                        " "+videoEncoding+" -fps_mode passthrough -filter_threads 1 -c:a aac -b:a 192k -af "+Q(audioFilter)+" -metadata:s:v:0 rotate=0 -movflags +faststart "+Q(partial);
                     using(var encoder=Start("ffmpeg",encodeArgs))
                     using(cancel.Register(()=>{Kill(decoder);Kill(encoder);})) {
                         var encodeError=encoder.StandardError.ReadToEndAsync();
@@ -289,11 +320,43 @@ namespace NtscStudio {
         }
     }
 
+    sealed class ExportSettingsForm : Form {
+        readonly ComboBox size=new ComboBox(),fps=new ComboBox(),quality=new ComboBox(),encoder=new ComboBox();
+        static readonly int[] edges={0,854,1280,1920,2560,3840};
+        static readonly string[] rates={null,"24000/1001","24/1","25/1","30000/1001","30/1","50/1","60000/1001","60/1","120/1"};
+        static readonly int[] levels={10,14,18,23};
+        readonly Options options;
+        readonly Label summary=new Label { Dock=DockStyle.Fill,AutoSize=false };
+        public ExportSettingsForm(VideoInfo video,Options settings) {
+            options=settings;Text="내보내기 설정 · 0.0.4";ClientSize=new Size(520,350);FormBorderStyle=FormBorderStyle.FixedDialog;
+            MaximizeBox=false;MinimizeBox=false;StartPosition=FormStartPosition.CenterParent;Font=new Font("맑은 고딕",10);
+            var panel=new TableLayoutPanel { Dock=DockStyle.Fill,Padding=new Padding(22),ColumnCount=2,RowCount=6 };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute,110));panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent,100));
+            for(int i=0;i<4;i++)panel.RowStyles.Add(new RowStyle(SizeType.Absolute,43));
+            panel.RowStyles.Add(new RowStyle(SizeType.Percent,100));panel.RowStyles.Add(new RowStyle(SizeType.Absolute,42));Controls.Add(panel);
+            var combos=new[]{size,fps,quality,encoder};string[] names={"저장 해상도","저장 FPS","압축 품질","파일 인코딩"};
+            for(int i=0;i<4;i++){combos[i].DropDownStyle=ComboBoxStyle.DropDownList;combos[i].Dock=DockStyle.Top;panel.Controls.Add(new Label { Text=names[i],AutoSize=true,Padding=new Padding(0,5,0,0) },0,i);panel.Controls.Add(combos[i],1,i);}
+            size.Items.AddRange(new object[]{"원본 유지","480p","720p · HD","1080p · Full HD","1440p · QHD","2160p · 4K"});
+            fps.Items.AddRange(new object[]{"원본 유지","23.976","24","25","29.97","30","50","59.94","60","120"});
+            quality.Items.AddRange(new object[]{"최고 · 파일 큼","높음 · 기본","균형","용량 절약"});
+            encoder.Items.AddRange(new object[]{"CPU · H.264","GPU · NVIDIA NVENC"});
+            size.SelectedIndex=Math.Max(0,Array.IndexOf(edges,options.OutputMaxEdge));fps.SelectedIndex=Math.Max(0,Array.IndexOf(rates,options.OutputRate));
+            quality.SelectedIndex=Math.Max(0,Array.IndexOf(levels,options.Quality));encoder.SelectedIndex=options.Encoder=="nvenc"?1:0;
+            Action update=()=>{var o=new Options {OutputMaxEdge=edges[size.SelectedIndex]};int w,h;Engine.OutputSize(video,o,out w,out h);
+                summary.Text=w+" × "+h+" · "+(fps.SelectedIndex==0?video.Fps.ToString("0.###"):Convert.ToString(fps.SelectedItem))+" fps\n원본보다 크게 확대하지 않습니다. FPS 변경은 프레임 반복/생략 방식입니다.\n저장: vid/영상제목_NTSC.mp4";};
+            panel.Controls.Add(summary,0,4);panel.SetColumnSpan(summary,2);
+            size.SelectedIndexChanged+=(s,e)=>update();fps.SelectedIndexChanged+=(s,e)=>update();update();
+            var buttons=new FlowLayoutPanel { Dock=DockStyle.Fill,FlowDirection=FlowDirection.RightToLeft };
+            var start=new Button { Text="인코딩 시작",AutoSize=true };var back=new Button { Text="취소",AutoSize=true,DialogResult=DialogResult.Cancel };
+            start.Click+=(s,e)=>{options.OutputMaxEdge=edges[size.SelectedIndex];options.OutputRate=rates[fps.SelectedIndex];options.Quality=levels[quality.SelectedIndex];options.Encoder=encoder.SelectedIndex==1?"nvenc":"cpu";DialogResult=DialogResult.OK;Close();};
+            buttons.Controls.Add(start);buttons.Controls.Add(back);panel.Controls.Add(buttons,0,5);panel.SetColumnSpan(buttons,2);AcceptButton=start;CancelButton=back;
+        }
+    }
     sealed class MainForm : Form {
         readonly TextBox path=new TextBox { ReadOnly=true,Dock=DockStyle.Fill };
         readonly Button open=new Button { Text="영상 열기",AutoSize=true };
         readonly Button preview=new Button { Text="미리보기",AutoSize=true };
-        readonly Button export=new Button { Text="인코딩 시작 · vid에 저장",Dock=DockStyle.Fill,Height=44 };
+        readonly Button export=new Button { Text="내보내기 설정 · vid에 저장",Dock=DockStyle.Fill,Height=44 };
         readonly Button cancel=new Button { Text="취소",Enabled=false,AutoSize=true };
         readonly Label infoLabel=new Label { Text="MP4 · MOV · MKV · AVI 등의 SDR 영상을 열어 주세요.",AutoSize=true,ForeColor=Color.FromArgb(90,100,110) };
         readonly Label status=new Label { Text="준비됨",Dock=DockStyle.Fill,TextAlign=ContentAlignment.MiddleLeft };
@@ -315,15 +378,16 @@ namespace NtscStudio {
         readonly int[] visibleIndexes={7,8,9,6,4,1};
         readonly List<Control> edits=new List<Control>();
         VideoInfo video;string input;CancellationTokenSource cancellation;bool busy;
+        string outputRate=null,outputEncoder="cpu";int outputEdge=0,outputQuality=14;
         public MainForm() {
-            Text="NTSC Video Studio";ClientSize=new Size(1120,880);MinimumSize=new Size(1000,850);
+            Text="NTSC Video Studio · 0.0.4";ClientSize=new Size(1120,880);MinimumSize=new Size(1000,850);
             Font=new Font("맑은 고딕",9.5f);BackColor=Color.FromArgb(246,247,249);AutoScaleMode=AutoScaleMode.Dpi;
             var root=new TableLayoutPanel { Dock=DockStyle.Fill,Padding=new Padding(22),ColumnCount=1,RowCount=6 };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute,67));root.RowStyles.Add(new RowStyle(SizeType.Absolute,40));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute,37));root.RowStyles.Add(new RowStyle(SizeType.Percent,100));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute,26));root.RowStyles.Add(new RowStyle(SizeType.Absolute,32));Controls.Add(root);
             var head=new Panel { Dock=DockStyle.Fill };
-            head.Controls.Add(new Label { Text="NTSC Video Studio",Font=new Font("맑은 고딕",21,FontStyle.Bold),AutoSize=true,Location=new Point(0,0) });
+            head.Controls.Add(new Label { Text="NTSC Video Studio  0.0.4",Font=new Font("맑은 고딕",21,FontStyle.Bold),AutoSize=true,Location=new Point(0,0) });
             head.Controls.Add(new Label { Text="영상에 아날로그 색 번짐과 경계 무늬를 더하세요.",AutoSize=true,Location=new Point(2,43),ForeColor=Color.FromArgb(75,85,95) });root.Controls.Add(head,0,0);
             var renderPanel=new Panel { Dock=DockStyle.Right,Width=350 };
             var renderRow=new FlowLayoutPanel { Dock=DockStyle.Top,Height=35 };
@@ -348,7 +412,7 @@ namespace NtscStudio {
             for(int i=0;i<6;i++)settings.RowStyles.Add(new RowStyle(SizeType.Absolute,49));
             settings.RowStyles.Add(new RowStyle(SizeType.Absolute,55));settings.RowStyles.Add(new RowStyle(SizeType.Absolute,90));settings.RowStyles.Add(new RowStyle(SizeType.Percent,100));
             settings.Controls.Add(new Label { Text="효과 스타일",AutoSize=true },0,0);settings.Controls.Add(preset,0,1);
-            preset.Items.AddRange(new object[]{"컴포지트 · 기본","색 번짐 중심","선명한 영상","강한 아날로그 효과","캡처카드 · 예시 참고"});
+            preset.Items.AddRange(new object[]{"컴포지트 · 기본","색 번짐 중심","선명한 영상","강한 아날로그 효과","캡처카드 · 아날로그"});
             settings.Controls.Add(new Label { Text="효과 해상도 · V1 가로 기준",AutoSize=true },0,2);settings.Controls.Add(resolution,0,3);
             resolution.Items.AddRange(new object[]{"256","384","512 · V1 기본","640","768","1024","1536","1920 · Full HD","2560","3840 · 4K","5120","7680 · 8K"});resolution.SelectedIndex=2;
             string[] labels={"색 경계 무늬","밝기 경계의 색","색 번짐","수평 디테일","선명도","채도"};
@@ -392,7 +456,7 @@ namespace NtscStudio {
                 case 4: sliders[7].Value=25;sliders[8].Value=30;sliders[9].Value=20;sliders[4].Value=5;break;
             }
         }
-        Options ReadOptions() { return new Options {WorkWidth=new[]{256,384,512,640,768,1024,1536,1920,2560,3840,5120,7680}[resolution.SelectedIndex],Values=sliders.Select(x=>x.Value/100.0).ToArray(),EdgeStrength=strength.Value,EffectScale=new[]{0,1,2,3,4,6,8,12,16,24,32}[pattern.SelectedIndex],Scanlines=scanlines.Checked?15:0,UseGpu=renderer.SelectedIndex==1}; }
+        Options ReadOptions() { return new Options {WorkWidth=new[]{256,384,512,640,768,1024,1536,1920,2560,3840,5120,7680}[resolution.SelectedIndex],Values=sliders.Select(x=>x.Value/100.0).ToArray(),EdgeStrength=strength.Value,EffectScale=new[]{0,1,2,3,4,6,8,12,16,24,32}[pattern.SelectedIndex],Scanlines=scanlines.Checked?15:0,UseGpu=renderer.SelectedIndex==1,OutputRate=outputRate,OutputMaxEdge=outputEdge,Quality=outputQuality,Encoder=outputEncoder}; }
         void UpdateInfoLabel() {
             if(video==null)return;
             var timing=Engine.Timing(video,ReadOptions());
@@ -446,7 +510,10 @@ namespace NtscStudio {
         }
         async Task ExportVideo() {
             if(video==null||busy)return;
-                var settings=ReadOptions();cancellation=new CancellationTokenSource();SetBusy(true,true);bar.Value=0;status.Text="변환을 시작하는 중…";
+                var settings=ReadOptions();
+                using(var dialog=new ExportSettingsForm(video,settings)){if(dialog.ShowDialog(this)!=DialogResult.OK)return;}
+                outputRate=settings.OutputRate;outputEdge=settings.OutputMaxEdge;outputQuality=settings.Quality;outputEncoder=settings.Encoder;UpdateInfoLabel();
+                cancellation=new CancellationTokenSource();SetBusy(true,true);bar.Value=0;status.Text="변환을 시작하는 중…";
                 try {
                     int w,h;Engine.WorkingSize(video,settings,out w,out h);
                     string target=Engine.CreateVideoOutputPath(input);
@@ -463,6 +530,18 @@ namespace NtscStudio {
     }
     static class Program {
         static void SelectRenderer(string[] args,Options options) {
+            foreach(var arg in args) {
+                if(arg.StartsWith("--fps=")) {
+                    string rate=arg.Substring(6);if(rate=="source")options.OutputRate=null;
+                    else if(rate=="23.976")options.OutputRate="24000/1001";
+                    else if(rate=="29.97")options.OutputRate="30000/1001";
+                    else if(rate=="59.94")options.OutputRate="60000/1001";
+                    else {var parts=rate.Split('/');int n,d=1;if(parts.Length>2||!int.TryParse(parts[0],out n)||n<1||(parts.Length==2&&(!int.TryParse(parts[1],out d)||d<1)))throw new Exception("FPS must be source, an integer or a positive rational rate.");options.OutputRate=n+"/"+d;}
+                }
+                if(arg.StartsWith("--max-edge=")){options.OutputMaxEdge=int.Parse(arg.Substring(11));if(options.OutputMaxEdge!=0&&(options.OutputMaxEdge<64||options.OutputMaxEdge>8192))throw new Exception("Maximum output edge must be 0(source) or 64..8192.");}
+                if(arg.StartsWith("--quality=")){string q=arg.Substring(10);options.Quality=q=="best"?10:q=="high"?14:q=="balanced"?18:q=="small"?23:int.Parse(q);}
+                if(arg.StartsWith("--encoder=")){options.Encoder=arg.Substring(10);if(options.Encoder!="cpu"&&options.Encoder!="nvenc")throw new Exception("Encoder must be cpu or nvenc.");}
+            }
             string value=args.FirstOrDefault(x=>x.StartsWith("--renderer="));
             if(value==null)return;
             if(value=="--renderer=gpu")options.UseGpu=true;
@@ -482,7 +561,7 @@ namespace NtscStudio {
                     if(args.Length<3)throw new Exception("--convert INPUT OUTPUT [WIDTH: 64..8192]");
                     var options=new Options();
                     SelectRenderer(args,options);
-                    if(args.Length>3&&args[3]!="--animate") {
+                    if(args.Length>3&&!args[3].StartsWith("--")) {
                         options.WorkWidth=int.Parse(args[3]);
                     }
                     if(options.WorkWidth<64||options.WorkWidth>8192)throw new Exception("Width must be between 64 and 8192.");
@@ -490,7 +569,7 @@ namespace NtscStudio {
                     if(scaleArg!=null){options.EffectScale=int.Parse(scaleArg.Substring(15));if(options.EffectScale<0||options.EffectScale>32)throw new Exception("Effect scale must be 0(auto) or 1..32.");}
                     var info=Engine.Probe(args[1]);long count=Engine.ConvertVideo(args[1],args[2],info,options,CancellationToken.None,(n,s)=>{});
                     var timing=Engine.Timing(info,options);
-                    File.WriteAllText(args[2]+".result.txt","frames="+count+"\nfps="+timing.Rate+"\ninput_fps="+info.Rate+"\nphase_clock="+timing.ClockRate+"\nrenderer="+(options.UseGpu?"gpu":"cpu"),Encoding.UTF8);return 0;
+                    File.WriteAllText(args[2]+".result.txt","version=0.0.4\nframes="+count+"\nfps="+timing.Rate+"\ninput_fps="+info.Rate+"\nphase_clock="+timing.ClockRate+"\nrenderer="+(options.UseGpu?"gpu":"cpu")+"\nencoder="+options.Encoder+"\nquality="+options.Quality,Encoding.UTF8);return 0;
                 }
                 if(args.Length>0&&args[0]=="--self-test") {
                     var opts=new Options();int w=256,h=24;var rgb=new byte[w*h*3];
@@ -551,6 +630,13 @@ namespace NtscStudio {
                     }
                 }
                 Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
+                if(args.Length>0&&args[0]=="--export-settings-snapshot") {
+                    var settings=new Options();SelectRenderer(args,settings);
+                    using(var form=new ExportSettingsForm(Engine.Probe(args[2]),settings)) {
+                        form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-20000,-20000);form.ShowInTaskbar=false;form.Show();Application.DoEvents();
+                        using(var bmp=new Bitmap(form.Width,form.Height)){form.DrawToBitmap(bmp,new Rectangle(0,0,bmp.Width,bmp.Height));bmp.Save(args[1],ImageFormat.Png);}form.Close();
+                    }return 0;
+                }
                 if(args.Length>0&&args[0]=="--ui-snapshot") {
                     using(var form=new MainForm()){
                         form.StartPosition=FormStartPosition.Manual;form.Location=new Point(-20000,-20000);form.ShowInTaskbar=false;
